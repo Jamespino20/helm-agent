@@ -55,7 +55,7 @@ prisma.$connect()
       console.log(`HELM Agent API listening on http://localhost:${PORT}`);
     });
   })
-  .catch((e) => {
+  .catch((e: Error) => {
     console.error("Failed to connect to DB:", e);
     process.exit(1);
   });
