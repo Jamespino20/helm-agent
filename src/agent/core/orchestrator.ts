@@ -1,17 +1,18 @@
 /**
  * Agent orchestrator — the full RMA intake flow.
- * 1. Lookup original receipt
+ * HELM owns the Neon DB; this agent is a stateless AI orchestrator that calls HELM's API.
+ *
+ * Flow:
+ * 1. Lookup original receipt via HELM API
  * 2. Assess damage photo with SAM 3.1
  * 3. Reason about eligibility with Muse Spark
- * 4. Create transaction + adjust stock + settle credit
- * 5. Draft buyer message with Llama
- * 6. Generate credit memo PDF data
+ * 4. Create RMA transaction via HELM API (HELM handles stock + credit)
+ * 5. Draft buyer message with Llama + generate credit memo
  */
-import { prisma } from "../../server";
 import { MetaModelClient } from "../models/meta-api";
 import { SamClient } from "../models/sam";
 import { RmaReasoner } from "../core/reasoning";
-import { applyStockChanges, settleCredit, generateCreditMemo } from "../core/intake";
+import { helmApi } from "../core/http-client";
 
 export class RmaAgent {
   private meta: MetaModelClient;
@@ -29,25 +30,26 @@ export class RmaAgent {
    */
   async intake({
     receiptNumber,
-    damageImage, // base64 or Buffer
+    damageImage, // base64 string
     buyerName,
     requestedItems, // [{ productId, quantity }]
     sellerId,
     sellerName = "Agent",
   }: {
     receiptNumber: number;
-    damageImage?: string | Buffer;
+    damageImage?: string;
     buyerName: string;
     requestedItems: Array<{ productId: number; quantity: number }>;
     sellerId?: number;
     sellerName?: string;
   }) {
-    // Step 1: Lookup original receipt
-    const original = await prisma.transaction.findFirst({
-      where: { receiptNumber },
-      include: { items: true },
-    });
-    if (!original) throw new Error(`Receipt #${receiptNumber} not found`);
+    // Step 1: Lookup original receipt via HELM API
+    let original: any;
+    try {
+      original = await helmApi.lookupReceipt(receiptNumber);
+    } catch {
+      throw new Error(`Receipt #${receiptNumber} not found`);
+    }
 
     // Step 2: Assess damage photo with SAM 3.1 (if provided)
     let damageAssessment: any = null;
@@ -73,7 +75,7 @@ export class RmaAgent {
 
     const txType = eligibility.recommendedType;
 
-    // Step 4: Build transaction data
+    // Step 4: Build items with prices from original receipt
     const itemsWithPrices = requestedItems.map((item) => {
       const origItem = original.items.find(
         (i: any) => i.productId === item.productId
@@ -94,68 +96,31 @@ export class RmaAgent {
       0
     );
 
-    // Step 5: Create transaction via Prisma (agent writes directly to schema)
-    const lastReceipt = await prisma.transaction.findFirst({
-      orderBy: { receiptNumber: "desc" },
-      select: { receiptNumber: true },
-    });
-    const newReceiptNumber = (lastReceipt?.receiptNumber ?? 1000) + 1;
-
-    const transaction = await prisma.transaction.create({
-      data: {
-        receiptNumber: newReceiptNumber,
+    // Step 5: Create RMA transaction via HELM API (HELM handles stock + credit)
+    let created: any;
+    try {
+      created = await helmApi.createRma({
         buyerName,
-        transactionType: eligibility.recommendedType,
-        transactionStatus: "Completed",
-        transactionDate: new Date(),
+        transactionType: txType,
         grandTotal,
+        returnForReceiptNumber: receiptNumber,
+        isCredit: true,
         sellerId,
         sellerName,
-        returnForReceiptNumber: receiptNumber,
-        isCredit: true, // RMA typically issues credit
-        creditDueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000), // 30 days
-      },
-      include: { items: true },
-    });
-
-    // Create transaction items
-    await prisma.transactionItem.createMany({
-      data: itemsWithPrices.map((i) => ({
-        transactionId: transaction.id,
-        productId: i.productId,
-        productName: i.productName,
-        quantity: i.quantity,
-        unitPrice: i.unitPrice,
-        totalPrice: i.totalPrice,
-      })),
-    });
-
-    // Apply stock changes
-    await applyStockChanges(txType, requestedItems);
-
-    // Settle credit
-    let buyer = await prisma.buyer.findFirst({ where: { name: buyerName } });
-    if (!buyer) {
-      buyer = await prisma.buyer.create({
-        data: { name: buyerName, totalOrders: 1, totalSpent: 0 },
+        items: itemsWithPrices,
       });
+    } catch (e: any) {
+      throw new Error(`RMA creation failed: ${e.message}`);
     }
-    await settleCredit(buyer.id, txType, grandTotal);
 
-    // Link buyer to transaction
-    await prisma.transaction.update({
-      where: { id: transaction.id },
-      data: { buyerId: buyer.id },
-    });
-
-    // Step 6: Draft buyer message with Llama
-    const memo = await generateCreditMemo(transaction, buyer, itemsWithPrices);
+    // Step 6: Generate credit memo + draft buyer message with Llama
+    const memo = this.generateCreditMemo(created, buyerName, itemsWithPrices);
     let buyerMessage = "";
     try {
       buyerMessage = await this.meta.draftBuyerMessage({
         buyerName,
         type: txType,
-        receiptNumber: newReceiptNumber,
+        receiptNumber: created.receiptNumber,
         grandTotal,
         creditMemoNumber: memo.memoNumber,
       });
@@ -165,12 +130,39 @@ export class RmaAgent {
 
     return {
       status: "completed",
-      transaction,
-      buyer,
+      transaction: created,
+      buyer: { name: buyerName },
       creditMemo: memo,
       buyerMessage,
       damageAssessment,
       eligibility,
+    };
+  }
+
+  /**
+   * Generate a credit memo (PDF-ready data) for the buyer. Pure function — no DB needed.
+   */
+  private generateCreditMemo(
+    transaction: any,
+    buyerName: string,
+    items: any[]
+  ) {
+    return {
+      memoNumber: `CM-${transaction.receiptNumber}`,
+      originalReceipt: transaction.returnForReceiptNumber,
+      date: new Date().toISOString(),
+      buyer: { name: buyerName },
+      seller: transaction.sellerName,
+      type: transaction.transactionType,
+      items: items.map((i) => ({
+        productName: i.productName,
+        quantity: i.quantity,
+        unitPrice: Number(i.unitPrice || 0),
+        totalPrice: Number(i.totalPrice || 0),
+      })),
+      grandTotal: Number(transaction.grandTotal || 0),
+      isCredit: transaction.isCredit,
+      creditDueDate: transaction.creditDueDate,
     };
   }
 }
