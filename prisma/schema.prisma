@@ -1,0 +1,160 @@
+/*
+App Name: HELM Agent (AnvilOS derivative)
+App Client: Warranty/RMA Intake Agent
+Author: James Bryant D. Espino
+Last Update Date: Oct 27, 2026
+
+Stripped 4-domain schema for the hackathon submission.
+Only Return / Damage / Adjustment transaction types kept.
+Category, Brand, Finance, Notifications, AuditLog, etc. removed.
+*/
+
+generator client {
+  provider   = "prisma-client-js"
+  engineType = "library"
+}
+
+datasource db {
+  provider = "mysql"
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Enums
+// ────────────────────────────────────────────────────────────────────
+
+enum TransactionType {
+  Return
+  Damage
+  Adjustment
+
+  @@map("transaction_type")
+}
+
+enum TransactionStatus {
+  Ongoing
+  Completed
+  Cancelled
+
+  @@map("transaction_status")
+}
+
+// ────────────────────────────────────────────────────────────────────
+// Models
+// ────────────────────────────────────────────────────────────────────
+
+/// System users / cashiers / admins (STAFF role only for the agent)
+model User {
+  id        Int      @id @default(autoincrement()) @map("USER_ID")
+  name      String   @map("USER_NAME")
+  username  String   @unique @map("USERNAME")
+  role      String   @default("STAFF") @map("ROLE")
+  isActive  Boolean  @default(true) @map("IS_ACTIVE")
+
+  transactions Transaction[]
+
+  @@map("users")
+}
+
+/// Vendors / suppliers
+model Supplier {
+  id            Int     @id @default(autoincrement()) @map("SUPPLIER_ID")
+  supplierName  String  @map("SUPPLIER_NAME")
+  contactName   String? @map("CONTACT_NAME")
+  contactNumber String? @map("CONTACT_NUMBER")
+  email         String? @map("EMAIL")
+  address       String? @map("ADDRESS")
+  tin           String? @map("TIN")
+  isAvailable   Boolean @default(true) @map("IS_AVAILABLE")
+
+  products Product[]
+
+  @@map("suppliers")
+}
+
+/// Inventory items / SKUs (flat strings — no Category/Brand relations)
+model Product {
+  id             Int      @id @default(autoincrement()) @map("PRODUCT_ID")
+  productName    String   @map("PRODUCT_NAME")
+  category       String   @map("CATEGORY")
+  supplierId     Int?     @map("SUPPLIER_ID")
+  supplierName   String   @map("SUPPLIER_NAME")
+  brandName      String   @map("BRAND_NAME")
+  unitPrice      Decimal? @db.Decimal(10, 2) @map("UNIT_PRICE")
+  sellingPrice   Decimal  @db.Decimal(10, 2) @map("SELLING_PRICE")
+  quantity       Int      @map("QUANTITY")
+  minThreshold   Int      @map("MIN_THRESHOLD")
+  isAvailable    Boolean  @default(true) @map("IS_AVAILABLE")
+  imageUrl       String?  @db.LongText @map("IMAGE_URL")
+
+  supplierRel   Supplier?        @relation(fields: [supplierId], references: [id])
+  transactionItems TransactionItem[]
+
+  @@index([supplierId])
+  @@map("products")
+}
+
+/// Customers / clients who purchase products
+model Buyer {
+  id           Int      @id @default(autoincrement()) @map("BUYER_ID")
+  name         String   @map("BUYER_NAME")
+  email        String?  @map("EMAIL")
+  phone        String?  @map("PHONE")
+  address      String?  @map("ADDRESS")
+  tin          String?  @map("TIN")
+  creditBalance Decimal @default(0) @db.Decimal(10, 2) @map("CREDIT_BALANCE")
+  totalOrders  Int      @default(0) @map("TOTAL_ORDERS")
+  totalSpent   Decimal  @default(0) @db.Decimal(10, 2) @map("TOTAL_SPENT")
+
+  transactions Transaction[]
+
+  @@map("buyers")
+}
+
+/// Transaction headers — RMA intake only (Return / Damage / Adjustment)
+model Transaction {
+  id                     Int               @id @default(autoincrement()) @map("TRANSACTION_ID")
+  receiptNumber          Int               @map("RECEIPT_NUMBER")
+  buyerName              String            @map("BUYER_NAME")
+  buyerAddress           String?           @map("BUYER_ADDRESS")
+  buyerContact           String?           @map("BUYER_CONTACT")
+  sellerId               Int?              @map("SELLER_ID")
+  sellerName             String?           @map("SELLER_NAME")
+  transactionType        TransactionType   @map("TRANSACTION_TYPE")
+  transactionStatus      TransactionStatus @default(Ongoing) @map("TRANSACTION_STATUS")
+  transactionDate        DateTime          @map("TRANSACTION_DATE")
+  grandTotal             Decimal?          @db.Decimal(10, 2) @map("GRAND_TOTAL")
+  paymentMethod          String?           @map("PAYMENT_METHOD")
+  isCredit               Boolean           @default(false) @map("IS_CREDIT")
+  creditDueDate          DateTime?         @map("CREDIT_DUE_DATE")
+  returnForReceiptNumber Int?              @map("RETURN_FOR_RECEIPT_NUMBER")
+  buyerId                Int?              @map("BUYER_ID")
+
+  seller User?     @relation(fields: [sellerId], references: [id])
+  buyer  Buyer?   @relation(fields: [buyerId], references: [id])
+  items  TransactionItem[]
+
+  @@index([sellerId])
+  @@index([buyerId])
+  @@index([receiptNumber])
+  @@index([transactionDate])
+  @@map("transactions")
+}
+
+/// Line items within a transaction
+model TransactionItem {
+  id            Int      @id @default(autoincrement()) @map("ITEM_ID")
+  transactionId Int?     @map("TRANSACTION_ID")
+  productId     Int?     @map("PRODUCT_ID")
+  productName   String?  @map("PRODUCT_NAME")
+  quantity      Int?     @map("QUANTITY")
+  unitPrice     Decimal? @db.Decimal(10, 2) @map("UNIT_PRICE")
+  totalPrice    Decimal? @db.Decimal(10, 2) @map("TOTAL_PRICE")
+  costPrice     Decimal? @db.Decimal(10, 2) @map("COST_PRICE")
+
+  transaction Transaction? @relation(fields: [transactionId], references: [id])
+  product     Product?     @relation(fields: [productId], references: [id])
+
+  @@index([transactionId])
+  @@index([productId])
+  @@map("transaction_items")
+}
