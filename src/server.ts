@@ -49,15 +49,18 @@ app.use((err: any, _req: Request, res: Response, _next: NextFunction) => {
   res.status(500).json({ error: err.message || "internal server error" });
 });
 
-prisma.$connect()
-  .then(() => {
-    app.listen(PORT, () => {
-      console.log(`HELM Agent API listening on http://localhost:${PORT}`);
+// Only listen locally; on Vercel the app is exported as a serverless handler
+if (process.env.VERCEL !== "1") {
+  prisma.$connect()
+    .then(() => {
+      app.listen(PORT, () => {
+        console.log(`HELM Agent API listening on http://localhost:${PORT}`);
+      });
+    })
+    .catch((e: Error) => {
+      console.error("Failed to connect to DB:", e);
+      process.exit(1);
     });
-  })
-  .catch((e: Error) => {
-    console.error("Failed to connect to DB:", e);
-    process.exit(1);
-  });
+}
 
 export default app;
